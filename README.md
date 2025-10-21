@@ -66,3 +66,11 @@ sender.exe 192.168.1.100
 ## Notes
 
 This program does NOT encrypt the content of the packets. This means that if you use this inside an unsafe network, this functionally becomes a keylogger that can be potentially sniffed by a malicious attacker on the network. Use at your own risk, if you understand what this does and who it's for.
+
+## License
+
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
+
+You may use, modify, and share this code for personal or educational
+(non-commercial) purposes.  
+Commercial use of any kind requires my explicit permission.
