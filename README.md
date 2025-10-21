@@ -18,7 +18,8 @@ When inactive (99% of the time):
 - Essentially zero CPU/memory usage
 
 When active (after pressing hotkey):
-- Low-level hooks capture input
+- Low-level hooks capture keyboard input
+- RawInput API captures the mouse input
 - Direct UDP transmission to target PC
 - Input is blocked on source PC
 
