@@ -86,9 +86,6 @@ static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
     else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
         is_ctrl_pressed_down.store(isDown, std::memory_order_relaxed);
 
-    std::cout << "LLKbdHook: vk=" << vk << " isDown=" << isDown << "\n";
-    // print the state of ctrl and shift
-    std::cout << "  ctrl=" << is_ctrl_pressed_down.load() << " shift=" << is_shift_pressed_down.load() << "\n";
     // ctrl+shift+k toggle
     if (isDown && vk == 'K' && is_ctrl_pressed_down.load() && is_shift_pressed_down.load())
     {
