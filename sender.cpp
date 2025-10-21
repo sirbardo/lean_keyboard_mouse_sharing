@@ -48,6 +48,8 @@ struct InputPacket
 
 // ------------------------- globals ------------------------
 static std::atomic<bool> g_capturing{false};
+static std::atomic<bool> is_shift_pressed_down{false};
+static std::atomic<bool> is_ctrl_pressed_down{false};
 static SOCKET g_sock = INVALID_SOCKET;
 static sockaddr_in g_recvAddr{};
 static HWND g_msgWnd = nullptr;
@@ -78,10 +80,17 @@ static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const DWORD vk = k->vkCode;
 
+    // track ctrl/shift state
+    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+        is_shift_pressed_down.store(isDown, std::memory_order_relaxed);
+    else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+        is_ctrl_pressed_down.store(isDown, std::memory_order_relaxed);
+
+    std::cout << "LLKbdHook: vk=" << vk << " isDown=" << isDown << "\n";
+    // print the state of ctrl and shift
+    std::cout << "  ctrl=" << is_ctrl_pressed_down.load() << " shift=" << is_shift_pressed_down.load() << "\n";
     // ctrl+shift+k toggle
-    if (isDown && vk == 'K' &&
-        ((GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000)) &&
-        ((GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000)))
+    if (isDown && vk == 'K' && is_ctrl_pressed_down.load() && is_shift_pressed_down.load())
     {
         PostMessageW(g_msgWnd, WM_APP_TOGGLE, 0, 0);
         return 1;
@@ -147,6 +156,10 @@ static void StartCapture()
         g_capturing = false;
         return;
     }
+
+    // to make sure that ctrl and shift don't get stuck down when toggling capture while holding them
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
 
     // install LL hooks (eat local input)
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouHook, GetModuleHandleW(nullptr), 0);
