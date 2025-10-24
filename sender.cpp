@@ -173,6 +173,27 @@ static void StopCapture()
     if (!g_capturing.exchange(false))
         return;
 
+    // Send key-up events for Ctrl and Shift to the receiver before disconnecting
+    // This ensures they don't get stuck down on the remote machine
+    if (is_ctrl_pressed_down.load())
+    {
+        InputPacket p{};
+        p.type = InputPacket::KEYBOARD;
+        p.data.keyboard.vkCode = VK_CONTROL;
+        p.data.keyboard.down = false;
+        SendPacket(p);
+        is_ctrl_pressed_down = false;
+    }
+    if (is_shift_pressed_down.load())
+    {
+        InputPacket p{};
+        p.type = InputPacket::KEYBOARD;
+        p.data.keyboard.vkCode = VK_SHIFT;
+        p.data.keyboard.down = false;
+        SendPacket(p);
+        is_shift_pressed_down = false;
+    }
+
     // remove LL hooks
     if (g_mouseHook)
     {
