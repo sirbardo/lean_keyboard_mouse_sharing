@@ -5,13 +5,24 @@
 #include <stdint.h>
 #include <atomic>
 #include <iostream>
+#include <fstream>
+#include <string>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
 
 // ------------------------- config -------------------------
 static constexpr int PORT = 7777;
-static constexpr int HOTKEY_ID = 1; // ctrl+shift+k
+static constexpr int HOTKEY_ID = 1;
+
+// hotkey configuration (defaults to Alt+1)
+struct HotkeyConfig {
+    UINT modifiers = MOD_ALT;
+    UINT key = '1';
+    std::wstring description = L"ALT+1";
+};
+static HotkeyConfig g_hotkey;
 
 // ------------------------- protocol -----------------------
 struct InputPacket
@@ -69,6 +80,129 @@ static inline void SendPacket(const InputPacket &p)
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
 }
 
+// ------------------------- hotkey parsing -----------------
+static bool ParseHotkey(const std::wstring& hotkeyStr, HotkeyConfig& config)
+{
+    std::wstring str = hotkeyStr;
+    // convert to uppercase for case-insensitive parsing
+    std::transform(str.begin(), str.end(), str.begin(), ::towupper);
+
+    UINT mods = 0;
+    UINT key = 0;
+
+    // parse modifiers
+    if (str.find(L"CTRL") != std::wstring::npos || str.find(L"CONTROL") != std::wstring::npos)
+        mods |= MOD_CONTROL;
+    if (str.find(L"SHIFT") != std::wstring::npos)
+        mods |= MOD_SHIFT;
+    if (str.find(L"ALT") != std::wstring::npos)
+        mods |= MOD_ALT;
+    if (str.find(L"WIN") != std::wstring::npos)
+        mods |= MOD_WIN;
+
+    // find the key (last character that's not '+')
+    size_t lastPlus = str.rfind(L'+');
+    if (lastPlus != std::wstring::npos && lastPlus < str.length() - 1)
+    {
+        std::wstring keyStr = str.substr(lastPlus + 1);
+        // trim whitespace
+        keyStr.erase(0, keyStr.find_first_not_of(L" \t"));
+        keyStr.erase(keyStr.find_last_not_of(L" \t") + 1);
+
+        if (keyStr.length() == 1)
+        {
+            wchar_t c = keyStr[0];
+            if ((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z'))
+            {
+                key = (UINT)c;
+            }
+        }
+        else if (keyStr.length() == 2 && keyStr[0] == L'F' && keyStr[1] >= L'1' && keyStr[1] <= L'9')
+        {
+            // F1-F9
+            key = VK_F1 + (keyStr[1] - L'1');
+        }
+        else if (keyStr.length() == 3 && keyStr[0] == L'F' && keyStr[1] == L'1' && keyStr[2] >= L'0' && keyStr[2] <= L'2')
+        {
+            // F10-F12
+            key = VK_F10 + (keyStr[2] - L'0');
+        }
+    }
+
+    if (key == 0)
+        return false;
+
+    config.modifiers = mods;
+    config.key = key;
+    config.description = hotkeyStr;
+    return true;
+}
+
+static void ReadConfigFile(HotkeyConfig& config)
+{
+    std::wifstream file(L"sender.cfg");
+    if (!file.is_open())
+        return;
+
+    std::wstring line;
+    while (std::getline(file, line))
+    {
+        // skip empty lines and comments
+        if (line.empty() || line[0] == L'#' || line[0] == L';')
+            continue;
+
+        // look for HOTKEY=value
+        size_t eqPos = line.find(L'=');
+        if (eqPos != std::wstring::npos)
+        {
+            std::wstring key = line.substr(0, eqPos);
+            std::wstring value = line.substr(eqPos + 1);
+
+            // trim whitespace
+            key.erase(0, key.find_first_not_of(L" \t"));
+            key.erase(key.find_last_not_of(L" \t") + 1);
+            value.erase(0, value.find_first_not_of(L" \t"));
+            value.erase(value.find_last_not_of(L" \t") + 1);
+
+            std::transform(key.begin(), key.end(), key.begin(), ::towupper);
+
+            if (key == L"HOTKEY")
+            {
+                if (ParseHotkey(value, config))
+                {
+                    std::wcout << L"Config file: Using hotkey " << config.description << L"\n";
+                }
+                break;
+            }
+        }
+    }
+}
+
+static bool IsHotkeyPressed(DWORD vk)
+{
+    bool modifiersMatch = true;
+
+    // check if required modifiers are pressed
+    if (g_hotkey.modifiers & MOD_CONTROL)
+        modifiersMatch = modifiersMatch && is_ctrl_pressed_down.load();
+    else
+        modifiersMatch = modifiersMatch && !is_ctrl_pressed_down.load();
+
+    if (g_hotkey.modifiers & MOD_SHIFT)
+        modifiersMatch = modifiersMatch && is_shift_pressed_down.load();
+    else
+        modifiersMatch = modifiersMatch && !is_shift_pressed_down.load();
+
+    if (g_hotkey.modifiers & MOD_ALT)
+    {
+        // check if Alt is pressed
+        bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        modifiersMatch = modifiersMatch && altPressed;
+    }
+
+    return modifiersMatch && (vk == g_hotkey.key);
+}
+
 static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode < 0)
@@ -86,8 +220,8 @@ static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
     else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
         is_ctrl_pressed_down.store(isDown, std::memory_order_relaxed);
 
-    // ctrl+shift+k toggle
-    if (isDown && vk == 'K' && is_ctrl_pressed_down.load() && is_shift_pressed_down.load())
+    // dynamic hotkey toggle
+    if (isDown && IsHotkeyPressed(vk))
     {
         PostMessageW(g_msgWnd, WM_APP_TOGGLE, 0, 0);
         return 1;
@@ -329,11 +463,37 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // ------------------------- entry --------------------------
 int wmain(int argc, wchar_t *argv[])
 {
-    if (argc != 2)
+    if (argc < 2)
     {
-        std::wcout << L"usage: sender.exe <receiver_ip>\n"
-                      L"example: sender.exe 192.168.1.100\n";
+        std::wcout << L"usage: sender.exe <receiver_ip> [--hotkey=ALT+1]\n"
+                      L"example: sender.exe 192.168.1.100\n"
+                      L"         sender.exe 192.168.1.100 --hotkey=ALT+2\n"
+                      L"         sender.exe 192.168.1.100 --hotkey=CTRL+SHIFT+K\n";
         return 1;
+    }
+
+    // read config file for default hotkey
+    ReadConfigFile(g_hotkey);
+
+    // parse CLI arguments for hotkey override
+    for (int i = 2; i < argc; i++)
+    {
+        std::wstring arg = argv[i];
+        if (arg.find(L"--hotkey=") == 0)
+        {
+            std::wstring hotkeyStr = arg.substr(9);
+            HotkeyConfig tempConfig;
+            if (ParseHotkey(hotkeyStr, tempConfig))
+            {
+                g_hotkey = tempConfig;
+                std::wcout << L"CLI override: Using hotkey " << g_hotkey.description << L"\n";
+            }
+            else
+            {
+                std::wcerr << L"Invalid hotkey format: " << hotkeyStr << L"\n";
+                return 1;
+            }
+        }
     }
 
     // init sockets
@@ -386,10 +546,10 @@ int wmain(int argc, wchar_t *argv[])
         return 1;
     }
 
-    // hotkey ctrl+shift+k (toggle capture)
-    if (!RegisterHotKey(g_msgWnd, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, 'K'))
+    // register dynamic hotkey (toggle capture)
+    if (!RegisterHotKey(g_msgWnd, HOTKEY_ID, g_hotkey.modifiers, g_hotkey.key))
     {
-        std::cerr << "RegisterHotKey failed\n";
+        std::wcerr << L"RegisterHotKey failed (hotkey may be in use by another application)\n";
         DestroyWindow(g_msgWnd);
         closesocket(g_sock);
         WSACleanup();
@@ -397,7 +557,7 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     std::wcout << L"sender running → target " << argv[1] << L":" << PORT << L"\n";
-    std::cout << "press CTRL+SHIFT+K to toggle capture (blocks local input when ON)\n";
+    std::wcout << L"press " << g_hotkey.description << L" to toggle capture (blocks local input when ON)\n";
 
     // message loop
     MSG msg;
