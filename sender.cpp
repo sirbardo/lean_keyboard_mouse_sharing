@@ -61,6 +61,7 @@ struct InputPacket
 static std::atomic<bool> g_capturing{false};
 static std::atomic<bool> is_shift_pressed_down{false};
 static std::atomic<bool> is_ctrl_pressed_down{false};
+static std::atomic<bool> is_alt_pressed_down{false};
 static SOCKET g_sock = INVALID_SOCKET;
 static sockaddr_in g_recvAddr{};
 static HWND g_msgWnd = nullptr;
@@ -180,27 +181,24 @@ static void ReadConfigFile(HotkeyConfig& config)
 
 static bool IsHotkeyPressed(DWORD vk)
 {
-    bool modifiersMatch = true;
+    // check key matches
+    if (vk != g_hotkey.key)
+        return false;
 
-    // check if required modifiers are pressed
+    // check that required modifiers are pressed (using tracked state)
     if (g_hotkey.modifiers & MOD_CONTROL)
-        modifiersMatch = modifiersMatch && is_ctrl_pressed_down.load();
-    else
-        modifiersMatch = modifiersMatch && !is_ctrl_pressed_down.load();
+        if (!is_ctrl_pressed_down.load())
+            return false;
 
     if (g_hotkey.modifiers & MOD_SHIFT)
-        modifiersMatch = modifiersMatch && is_shift_pressed_down.load();
-    else
-        modifiersMatch = modifiersMatch && !is_shift_pressed_down.load();
+        if (!is_shift_pressed_down.load())
+            return false;
 
     if (g_hotkey.modifiers & MOD_ALT)
-    {
-        // check if Alt is pressed
-        bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        modifiersMatch = modifiersMatch && altPressed;
-    }
+        if (!is_alt_pressed_down.load())
+            return false;
 
-    return modifiersMatch && (vk == g_hotkey.key);
+    return true;
 }
 
 static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
@@ -214,11 +212,13 @@ static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
     const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const DWORD vk = k->vkCode;
 
-    // track ctrl/shift state
+    // track ctrl/shift/alt state
     if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
         is_shift_pressed_down.store(isDown, std::memory_order_relaxed);
     else if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
         is_ctrl_pressed_down.store(isDown, std::memory_order_relaxed);
+    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+        is_alt_pressed_down.store(isDown, std::memory_order_relaxed);
 
     // dynamic hotkey toggle
     if (isDown && IsHotkeyPressed(vk))
@@ -288,9 +288,10 @@ static void StartCapture()
         return;
     }
 
-    // to make sure that ctrl and shift don't get stuck down when toggling capture while holding them
+    // to make sure that ctrl, shift, and alt don't get stuck down when toggling capture while holding them
     keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
     keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
 
     // install LL hooks (eat local input)
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouHook, GetModuleHandleW(nullptr), 0);
@@ -307,7 +308,7 @@ static void StopCapture()
     if (!g_capturing.exchange(false))
         return;
 
-    // Send key-up events for Ctrl and Shift to the receiver before disconnecting
+    // Send key-up events for Ctrl, Shift, and Alt to the receiver before disconnecting
     // This ensures they don't get stuck down on the remote machine
     if (is_ctrl_pressed_down.load())
     {
@@ -326,6 +327,15 @@ static void StopCapture()
         p.data.keyboard.down = false;
         SendPacket(p);
         is_shift_pressed_down = false;
+    }
+    if (is_alt_pressed_down.load())
+    {
+        InputPacket p{};
+        p.type = InputPacket::KEYBOARD;
+        p.data.keyboard.vkCode = VK_MENU;
+        p.data.keyboard.down = false;
+        SendPacket(p);
+        is_alt_pressed_down = false;
     }
 
     // remove LL hooks
