@@ -8,7 +8,13 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-gcc -O3 -static -o receiver.exe receiver.cpp -lws2_32 -luser32 -lstdc++
+windres receiver.rc receiver_res.o
+if %ERRORLEVEL% NEQ 0 (
+    echo Failed to compile receiver resources
+    exit /b 1
+)
+
+gcc -O3 -static -mwindows -o receiver.exe receiver.cpp receiver_res.o -lws2_32 -luser32 -lstdc++
 if %ERRORLEVEL% NEQ 0 (
     echo Failed to build receiver.exe
     exit /b 1

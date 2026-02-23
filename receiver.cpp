@@ -1,9 +1,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <iostream>
 #include <thread>
 #include <atomic>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
@@ -229,18 +229,11 @@ void ReceiverThread()
 {
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
-        std::cerr << "WSAStartup failed" << std::endl;
         return;
-    }
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET)
-    {
-        std::cerr << "Socket creation failed" << std::endl;
-        WSACleanup();
-        return;
-    }
+    { WSACleanup(); return; }
 
     sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -248,15 +241,7 @@ void ReceiverThread()
     addr.sin_port = htons(PORT);
 
     if (bind(sock, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
-    {
-        std::cerr << "Bind failed on port " << PORT << std::endl;
-        closesocket(sock);
-        WSACleanup();
-        return;
-    }
-
-    std::cout << "Receiver listening on port " << PORT << std::endl;
-    std::cout << "Press Ctrl+C to exit" << std::endl;
+    { closesocket(sock); WSACleanup(); return; }
 
     InputPacket packet;
     sockaddr_in senderAddr;
@@ -275,9 +260,7 @@ void ReceiverThread()
         {
             int error = WSAGetLastError();
             if (error != WSAEWOULDBLOCK && error != WSAEINTR)
-            {
-                std::cerr << "recvfrom failed: " << error << std::endl;
-            }
+                break;
         }
     }
 
@@ -285,22 +268,23 @@ void ReceiverThread()
     WSACleanup();
 }
 
-BOOL WINAPI ConsoleHandler(DWORD signal)
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT)
+    // Per-monitor DPI awareness: ensures GetCursorPos, GetSystemMetrics, and
+    // SendInput all use the same physical coordinate space across monitors.
+    // Without this, coordinates are DPI-virtualized and multi-monitor absolute
+    // positioning breaks.
     {
-        std::cout << "\nShutting down..." << std::endl;
-        g_running = false;
-        return TRUE;
+        // Try Per-Monitor V2 first (Win10 1703+), fall back gracefully.
+        using PFN = BOOL(WINAPI *)(HANDLE);
+        auto fn = reinterpret_cast<PFN>(
+            GetProcAddress(GetModuleHandleA("user32.dll"),
+                           "SetProcessDpiAwarenessContext"));
+        if (fn)
+            fn(reinterpret_cast<HANDLE>(-4)); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        else
+            SetProcessDPIAware(); // Vista+ fallback (system-DPI aware)
     }
-    return FALSE;
-}
-
-int main()
-{
-    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-
-    std::cout << "Keyboard/Mouse Receiver Starting..." << std::endl;
 
     HANDLE hCursorThread = CreateThread(nullptr, 0, CursorThreadProc, nullptr, 0, nullptr);
     std::thread receiverThread(ReceiverThread);
