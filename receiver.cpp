@@ -458,13 +458,9 @@ void ProcessPacket(const InputPacket &packet)
 
 void ReceiverThread()
 {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-        return;
-
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET)
-    { WSACleanup(); return; }
+        return;
 
     sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -496,7 +492,6 @@ void ReceiverThread()
     }
 
     closesocket(sock);
-    WSACleanup();
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
@@ -516,6 +511,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         else
             SetProcessDPIAware(); // Vista+ fallback (system-DPI aware)
     }
+
+    // Initialize Winsock before any threads that need sockets
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+        return 1;
 
     HANDLE hCursorThread = CreateThread(nullptr, 0, CursorThreadProc, nullptr, 0, nullptr);
 
