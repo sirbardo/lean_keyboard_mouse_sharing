@@ -190,8 +190,16 @@ static void ReadClipboard(uint8_t &content_type, std::vector<char> &data)
     content_type = CLIP_CONTENT_EMPTY;
     data.clear();
 
-    if (!OpenClipboard(nullptr))
-        return;
+    // Retry a few times — the clipboard may be briefly locked by the
+    // screenshot tool or another process that just wrote to it.
+    for (int attempt = 0; attempt < 10; ++attempt)
+    {
+        if (OpenClipboard(nullptr))
+            break;
+        Sleep(50);
+        if (attempt == 9)
+            return;
+    }
 
     // try image first (CF_DIB)
     HANDLE hDib = GetClipboardData(CF_DIB);
