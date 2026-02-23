@@ -310,14 +310,19 @@ static void ClipboardThread()
         if (client == INVALID_SOCKET)
             continue;
 
-        // set recv timeout
-        DWORD timeout_ms = 5000;
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<char *>(&timeout_ms), sizeof(timeout_ms));
-
-        // serve this connection until it closes
+        // serve this connection until it closes (use select to avoid
+        // blocking forever so we can check g_running periodically)
         while (g_running)
         {
+            fd_set cset;
+            FD_ZERO(&cset);
+            FD_SET(client, &cset);
+            timeval ctv{2, 0};
+
+            int csel = select(0, &cset, nullptr, nullptr, &ctv);
+            if (csel < 0) break;   // error
+            if (csel == 0) continue; // timeout — check g_running and wait again
+
             ClipHeader hdr{};
             if (!TcpRecvAll(client, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
                 break;
