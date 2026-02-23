@@ -194,8 +194,9 @@ constexpr UINT WM_APP_TOGGLE = WM_APP + 1; // used by LL hook to toggle when cap
 static HHOOK g_mouseHook = nullptr;
 static HHOOK g_keyHook = nullptr;
 
-// whether we currently have the cursor clipped
+// whether we currently have the cursor clipped + the pinned position
 static bool g_cursorClipped = false;
+static POINT g_clipPoint{};  // cursor position when clipped (for LL hook delta computation)
 
 // ------------------------- net ----------------------------
 static inline void SendPacket(const InputPacket &p)
@@ -370,7 +371,81 @@ static LRESULT CALLBACK LLMouHook(int nCode, WPARAM wParam, LPARAM lParam)
     if (!g_capturing.load(std::memory_order_relaxed))
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
-    // swallow all local mouse events during capture (cursor won't move / no clicks locally)
+    const MSLLHOOKSTRUCT *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lParam);
+
+    // --- movement: delta = intended position - pinned clip point ---
+    // pt is where the cursor *would* go (post-acceleration). Since we
+    // return 1 (block) the cursor stays at g_clipPoint, so each event's
+    // pt gives us the individual delta from the unmoved cursor.
+    {
+        int dx = ms->pt.x - g_clipPoint.x;
+        int dy = ms->pt.y - g_clipPoint.y;
+        if ((dx | dy) != 0)
+        {
+            InputPacket p{};
+            p.type = InputPacket::MOUSE_MOVE;
+            p.data.mouse_move.x = dx;
+            p.data.mouse_move.y = dy;
+            SendPacket(p);
+        }
+    }
+
+    // --- buttons ---
+    switch (wParam)
+    {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    {
+        InputPacket p{};
+        p.type = InputPacket::MOUSE_BUTTON;
+        p.data.mouse_button.button = 0;
+        p.data.mouse_button.down = (wParam == WM_LBUTTONDOWN);
+        SendPacket(p);
+        break;
+    }
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    {
+        InputPacket p{};
+        p.type = InputPacket::MOUSE_BUTTON;
+        p.data.mouse_button.button = 1;
+        p.data.mouse_button.down = (wParam == WM_RBUTTONDOWN);
+        SendPacket(p);
+        break;
+    }
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    {
+        InputPacket p{};
+        p.type = InputPacket::MOUSE_BUTTON;
+        p.data.mouse_button.button = 2;
+        p.data.mouse_button.down = (wParam == WM_MBUTTONDOWN);
+        SendPacket(p);
+        break;
+    }
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    {
+        WORD xbutton = HIWORD(ms->mouseData);
+        InputPacket p{};
+        p.type = InputPacket::MOUSE_BUTTON;
+        p.data.mouse_button.button = (xbutton == XBUTTON1) ? 3 : 4;
+        p.data.mouse_button.down = (wParam == WM_XBUTTONDOWN);
+        SendPacket(p);
+        break;
+    }
+    case WM_MOUSEWHEEL:
+    {
+        SHORT delta = (SHORT)HIWORD(ms->mouseData);
+        InputPacket p{};
+        p.type = InputPacket::MOUSE_WHEEL;
+        p.data.mouse_wheel.delta = (int)delta;
+        SendPacket(p);
+        break;
+    }
+    }
+
+    // block locally
     return 1;
 }
 
@@ -379,9 +454,8 @@ static void ClipCursor1x1AtCurrent(bool enable)
 {
     if (enable && !g_cursorClipped)
     {
-        POINT c;
-        GetCursorPos(&c);
-        RECT r{c.x, c.y, c.x + 1, c.y + 1};
+        GetCursorPos(&g_clipPoint);
+        RECT r{g_clipPoint.x, g_clipPoint.y, g_clipPoint.x + 1, g_clipPoint.y + 1};
         ClipCursor(&r);
         g_cursorClipped = true;
     }
@@ -396,20 +470,6 @@ static void StartCapture()
 {
     if (g_capturing.exchange(true))
         return;
-
-    RAWINPUTDEVICE rid[1]{};
-    // mouse
-    rid[0].usUsagePage = 0x01;
-    rid[0].usUsage = 0x02;
-    rid[0].dwFlags = RIDEV_INPUTSINK;
-    rid[0].hwndTarget = g_msgWnd;
-
-    if (!RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE)))
-    {
-        std::wcerr << L"RegisterRawInputDevices failed: " << GetLastError() << L"\n";
-        g_capturing = false;
-        return;
-    }
 
     // to make sure that ctrl, shift, and alt don't get stuck down when toggling capture while holding them
     keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
@@ -557,14 +617,6 @@ static void StopCapture()
         g_keyHook = nullptr;
     }
 
-    RAWINPUTDEVICE rid[1]{};
-    rid[0].usUsagePage = 0x01;
-    rid[0].usUsage = 0x02; // mouse
-    rid[0].dwFlags = RIDEV_REMOVE;
-    rid[0].hwndTarget = nullptr;
-
-    RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
-
     ClipCursor1x1AtCurrent(false);
 
     std::wcout << L"capture: OFF (local input restored)\n";
@@ -581,98 +633,6 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         else
             StartCapture();
         break;
-    case WM_INPUT:
-    {
-        if (!g_capturing.load(std::memory_order_relaxed))
-            break;
-
-        UINT size = 0;
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
-            break;
-
-        BYTE buf[1024];
-        if (size > sizeof(buf))
-            break;
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) != size)
-            break;
-
-        RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(buf);
-
-        if (ri->header.dwType == RIM_TYPEMOUSE)
-        {
-            const RAWMOUSE &m = ri->data.mouse;
-
-            // relative motion only
-            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE))
-            {
-                int dx = (int)m.lLastX;
-                int dy = (int)m.lLastY;
-                if ((dx | dy) != 0)
-                {
-                    InputPacket p{};
-                    p.type = InputPacket::MOUSE_MOVE;
-                    p.data.mouse_move.x = dx;
-                    p.data.mouse_move.y = dy;
-                    SendPacket(p);
-                }
-            }
-
-            // buttons
-            const USHORT f = m.usButtonFlags;
-            if (f & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 0;
-                p.data.mouse_button.down = (f & RI_MOUSE_LEFT_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 1;
-                p.data.mouse_button.down = (f & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 2;
-                p.data.mouse_button.down = (f & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 3;
-                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_4_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 4;
-                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_5_DOWN) != 0;
-                SendPacket(p);
-            }
-
-            // wheel
-            if (f & RI_MOUSE_WHEEL)
-            {
-                SHORT delta = (SHORT)m.usButtonData;
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_WHEEL;
-                p.data.mouse_wheel.delta = (int)delta;
-                SendPacket(p);
-            }
-        }
-        break;
-    }
-
     case WM_HOTKEY:
         if (wParam == HOTKEY_ID)
         {
