@@ -570,6 +570,8 @@ static void ProcessMouseEvent(const input_event& ev)
         if (ev.code == BTN_LEFT) button = 0;
         else if (ev.code == BTN_RIGHT) button = 1;
         else if (ev.code == BTN_MIDDLE) button = 2;
+        else if (ev.code == BTN_SIDE) button = 3;
+        else if (ev.code == BTN_EXTRA) button = 4;
 
         if (button >= 0) {
             InputPacket p{};
@@ -609,6 +611,8 @@ static void ProcessMouseEventWithAccum(const input_event& ev)
         if (ev.code == BTN_LEFT) button = 0;
         else if (ev.code == BTN_RIGHT) button = 1;
         else if (ev.code == BTN_MIDDLE) button = 2;
+        else if (ev.code == BTN_SIDE) button = 3;
+        else if (ev.code == BTN_EXTRA) button = 4;
 
         if (button >= 0) {
             InputPacket p{};
