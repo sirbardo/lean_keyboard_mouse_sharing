@@ -18,7 +18,7 @@
 static constexpr int PORT = 7777;
 static constexpr int CLIP_PORT = 7778;
 static constexpr int HOTKEY_ID = 1;
-static constexpr uint32_t CLIP_MAX_SIZE = 40 * 1024 * 1024; // 40 MB
+static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
 
 // hotkey configuration (defaults to Alt+1)
 struct HotkeyConfig {

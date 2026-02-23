@@ -144,7 +144,7 @@ static DWORD WINAPI CursorThreadProc(LPVOID)
 
 // ------------------------- clipboard protocol -------------
 static constexpr int CLIP_PORT = 7778;
-static constexpr uint32_t CLIP_MAX_SIZE = 40 * 1024 * 1024; // 40 MB
+static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
 
 #pragma pack(push, 1)
 struct ClipHeader
