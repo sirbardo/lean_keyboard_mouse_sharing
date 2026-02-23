@@ -6,8 +6,11 @@ Zero-overhead keyboard/mouse sharing between two Windows PCs.
 
 - **ZERO overhead when not in use** - Only hotkey monitoring runs
 - **Ultra-low latency** - Direct UDP packets, no buffering
+- **Clipboard sync** - Text and images synced automatically on toggle (up to 1GB)
+- **Multi-monitor support** - Per-monitor DPI-aware, works across any monitor layout
+- **UIAccess enabled** - Mouse works even through UAC elevation prompts
 - **Minimal dependencies** - Pure Win32 API, no external libraries
-- **Simple toggle** - Press CTRL+SHIFT+K to toggle
+- **Configurable hotkey** - Default ALT+1, configurable via CLI or config file
 
 ## Architecture
 
@@ -18,12 +21,14 @@ When inactive (99% of the time):
 - Essentially zero CPU/memory usage
 
 When active (after pressing hotkey):
-- Low-level hooks capture keyboard input
-- RawInput API captures the mouse input
+- Low-level hooks capture keyboard and mouse input at full polling rate
 - Direct UDP transmission to target PC
 - Input is blocked on source PC
+- Clipboard is synced via TCP (sender's clipboard pushed on capture start, receiver's clipboard pulled on capture stop)
 
 ## Building
+
+Requires MinGW with `gcc` and `windres` on PATH.
 
 ```batch
 build.bat
@@ -31,7 +36,7 @@ build.bat
 
 Creates:
 - `sender.exe` - Run on gaming PC
-- `receiver.exe` - Run on streaming PC
+- `receiver.exe` - Run on streaming PC (windowless)
 
 ## Usage
 
@@ -39,22 +44,40 @@ Creates:
 ```
 receiver.exe
 ```
+The receiver runs silently with no console window.
 
 **On Gaming PC:**
 ```
 sender.exe 192.168.1.100
+sender.exe 192.168.1.100 --hotkey=ALT+2
+sender.exe 192.168.1.100 --hotkey=CTRL+SHIFT+K
 ```
 (Replace with actual IP of streaming PC)
 
+You can also set the hotkey in a `sender.cfg` file next to the exe:
+```
+HOTKEY=ALT+1
+```
+
 ## Controls
 
-- **CTRL+SHIFT+K** - Toggle control between PCs
+- **ALT+1** (default) - Toggle control between PCs
 
 ## Network
 
-- Uses port 7777 (UDP)
-- Ensure Windows Firewall allows this port
+- Port 7777 (UDP) - keyboard/mouse input
+- Port 7778 (TCP) - clipboard sync
+- Ensure Windows Firewall allows both ports
 - Both PCs must be on same network
+
+## Deployment (receiver)
+
+For the receiver to work through UAC prompts, it needs UIAccess which requires:
+1. The embedded manifest (`receiver.manifest`) with `uiAccess="true"`
+2. The exe to be Authenticode-signed (self-signed works)
+3. Installed in a trusted location (e.g. `C:\Program Files\KMReceiver\`)
+
+The included `deploy_receiver.ps1` automates this: creates a self-signed cert, signs the exe, copies to Program Files, and sets up a startup shortcut.
 
 ## Performance
 
@@ -62,7 +85,6 @@ sender.exe 192.168.1.100
 - When active: <1% CPU for input capture/transmission
 - Network: ~10KB/s during active mouse movement
 - Latency: <1ms on local network
-
 
 ## Notes
 
@@ -73,5 +95,5 @@ This program does NOT encrypt the content of the packets. This means that if you
 This project is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
 
 You may use, modify, and share this code for personal or educational
-(non-commercial) purposes.  
+(non-commercial) purposes.
 Commercial use of any kind requires my explicit permission.
