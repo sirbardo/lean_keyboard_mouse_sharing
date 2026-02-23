@@ -508,40 +508,41 @@ static void StopCapture()
         is_alt_pressed_down = false;
     }
 
-    // clipboard sync: request receiver's clipboard in background
+    // clipboard sync: request receiver's clipboard (synchronous — socket is
+    // already connected so this is just a send+recv, ~100ms on LAN even for
+    // large screenshots).  Must complete before we return so the clipboard is
+    // ready when the user pastes.
     SOCKET clipSnap = g_clipSock;
     g_clipSock = INVALID_SOCKET;
 
     if (clipSnap != INVALID_SOCKET)
     {
-        std::thread([clipSnap]() {
-            ClipHeader hdr{};
-            hdr.msg_type = CLIP_MSG_REQUEST;
-            hdr.content_type = CLIP_CONTENT_EMPTY;
-            hdr.data_length = 0;
+        DWORD timeout_ms = 3000;
+        setsockopt(clipSnap, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char *>(&timeout_ms), sizeof(timeout_ms));
 
-            DWORD timeout_ms = 2000;
-            setsockopt(clipSnap, SOL_SOCKET, SO_RCVTIMEO,
-                       reinterpret_cast<char *>(&timeout_ms), sizeof(timeout_ms));
+        ClipHeader hdr{};
+        hdr.msg_type = CLIP_MSG_REQUEST;
+        hdr.content_type = CLIP_CONTENT_EMPTY;
+        hdr.data_length = 0;
 
-            if (TcpSendAll(clipSnap, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
+        if (TcpSendAll(clipSnap, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
+        {
+            ClipHeader resp{};
+            if (TcpRecvAll(clipSnap, reinterpret_cast<char *>(&resp), sizeof(resp)))
             {
-                ClipHeader resp{};
-                if (TcpRecvAll(clipSnap, reinterpret_cast<char *>(&resp), sizeof(resp)))
+                if (resp.msg_type == CLIP_MSG_DATA && resp.data_length <= CLIP_MAX_SIZE)
                 {
-                    if (resp.msg_type == CLIP_MSG_DATA && resp.data_length <= CLIP_MAX_SIZE)
+                    std::vector<char> clipData(resp.data_length);
+                    if (resp.data_length == 0 || TcpRecvAll(clipSnap, clipData.data(), (int)resp.data_length))
                     {
-                        std::vector<char> clipData(resp.data_length);
-                        if (resp.data_length == 0 || TcpRecvAll(clipSnap, clipData.data(), (int)resp.data_length))
-                        {
-                            WriteClipboard(resp.content_type, clipData);
-                        }
+                        WriteClipboard(resp.content_type, clipData);
                     }
                 }
             }
+        }
 
-            closesocket(clipSnap);
-        }).detach();
+        closesocket(clipSnap);
     }
 
     // remove LL hooks
