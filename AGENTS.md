@@ -31,6 +31,7 @@ Single `InputPacket` struct sent as raw UDP on port 7777. Four packet types: `MO
 
 ## Important constraints
 
+- **Sender performance is sacred.** The sender runs on a competitive gaming PC. When not actively capturing (which is 99% of the time), it must use absolute zero CPU and minimal RAM (<1MB). No polling loops, no timers, no background threads, no periodic network activity. The only thing running idle is a single hotkey listener. Any change to the sender must preserve this — if it adds overhead while inactive, it is unacceptable.
 - **No external dependencies.** Everything uses Win32 API or POSIX directly.
 - **Receiver must stay windowless.** It uses `WinMain` + `-mwindows`, no console.
 - **UIAccess manifest is required.** Without it, `SendInput` cannot reach elevated windows (UAC prompts). The exe must be Authenticode-signed and installed in a trusted location (e.g. Program Files) for UIAccess to take effect.
