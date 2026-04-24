@@ -19,6 +19,8 @@ static constexpr int PORT = 7777;
 static constexpr int CLIP_PORT = 7778;
 static constexpr int HOTKEY_ID = 1;
 static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
+static constexpr DWORD CLIP_CONNECT_TIMEOUT_MS = 1000;
+static constexpr DWORD CLIP_IO_TIMEOUT_MS = 3000;
 
 // hotkey configuration (defaults to Alt+1)
 struct HotkeyConfig {
@@ -192,8 +194,10 @@ static std::atomic<bool> is_shift_pressed_down{false};
 static std::atomic<bool> is_ctrl_pressed_down{false};
 static std::atomic<bool> is_alt_pressed_down{false};
 static SOCKET g_sock = INVALID_SOCKET;
-static SOCKET g_clipSock = INVALID_SOCKET;
 static sockaddr_in g_recvAddr{};
+static std::string g_targetHost;
+static bool g_targetIsLiteralIp = false;
+static std::atomic<bool> g_shuttingDown{false};
 static HWND g_msgWnd = nullptr;
 constexpr UINT WM_APP_TOGGLE = WM_APP + 1; // used by LL hook to toggle when capturing
 
@@ -201,15 +205,158 @@ constexpr UINT WM_APP_TOGGLE = WM_APP + 1; // used by LL hook to toggle when cap
 static HHOOK g_mouseHook = nullptr;
 static HHOOK g_keyHook = nullptr;
 
-// whether we currently have the cursor clipped + the pinned position
+// whether we currently have the cursor clipped
 static bool g_cursorClipped = false;
-static POINT g_clipPoint{};  // cursor position when clipped (for LL hook delta computation)
 
 // ------------------------- net ----------------------------
+static bool ResolveTarget()
+{
+    if (g_targetIsLiteralIp)
+        return true;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    addrinfo *res = nullptr;
+    if (getaddrinfo(g_targetHost.c_str(), nullptr, &hints, &res) != 0 || !res)
+        return false;
+    // aligned 32-bit write — readers in SendPacket see either old or new, never torn
+    g_recvAddr.sin_addr = reinterpret_cast<sockaddr_in *>(res->ai_addr)->sin_addr;
+    char resolved[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &g_recvAddr.sin_addr, resolved, sizeof(resolved));
+    std::cout << "resolved " << g_targetHost << " -> " << resolved << "\n";
+    freeaddrinfo(res);
+    return true;
+}
+
 static inline void SendPacket(const InputPacket &p)
 {
     sendto(g_sock, reinterpret_cast<const char *>(&p), sizeof(p), 0,
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
+}
+
+static void SetTcpTimeouts(SOCKET s, DWORD timeout_ms)
+{
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+}
+
+static SOCKET ConnectClipboardSocket()
+{
+    SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (cs == INVALID_SOCKET)
+        return INVALID_SOCKET;
+
+    u_long nonblocking = 1;
+    ioctlsocket(cs, FIONBIO, &nonblocking);
+
+    sockaddr_in clipAddr{};
+    clipAddr.sin_family = AF_INET;
+    clipAddr.sin_port = htons(CLIP_PORT);
+    clipAddr.sin_addr = g_recvAddr.sin_addr;
+
+    int rc = connect(cs, reinterpret_cast<sockaddr *>(&clipAddr), sizeof(clipAddr));
+    if (rc == SOCKET_ERROR)
+    {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEALREADY)
+        {
+            closesocket(cs);
+            return INVALID_SOCKET;
+        }
+
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(cs, &wset);
+        timeval tv{
+            static_cast<long>(CLIP_CONNECT_TIMEOUT_MS / 1000),
+            static_cast<long>((CLIP_CONNECT_TIMEOUT_MS % 1000) * 1000)};
+
+        if (select(0, nullptr, &wset, nullptr, &tv) <= 0)
+        {
+            closesocket(cs);
+            return INVALID_SOCKET;
+        }
+
+        int soerr = 0;
+        int soerrLen = sizeof(soerr);
+        if (getsockopt(cs, SOL_SOCKET, SO_ERROR,
+                       reinterpret_cast<char *>(&soerr), &soerrLen) == SOCKET_ERROR ||
+            soerr != 0)
+        {
+            closesocket(cs);
+            return INVALID_SOCKET;
+        }
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(cs, FIONBIO, &blocking);
+    SetTcpTimeouts(cs, CLIP_IO_TIMEOUT_MS);
+    return cs;
+}
+
+static void PushClipboardToReceiver()
+{
+    uint8_t clipCt;
+    std::vector<char> clipPayload;
+    ReadClipboard(clipCt, clipPayload);
+
+    if (g_shuttingDown.load(std::memory_order_relaxed))
+        return;
+
+    SOCKET cs = ConnectClipboardSocket();
+    if (cs == INVALID_SOCKET)
+        return;
+
+    ClipHeader hdr{};
+    hdr.msg_type = CLIP_MSG_DATA;
+    hdr.content_type = clipCt;
+    hdr.data_length = static_cast<uint32_t>(clipPayload.size());
+
+    if (TcpSendAll(cs, reinterpret_cast<char *>(&hdr), sizeof(hdr)) && !clipPayload.empty())
+        TcpSendAll(cs, clipPayload.data(), static_cast<int>(clipPayload.size()));
+
+    closesocket(cs);
+}
+
+static void PullClipboardFromReceiver()
+{
+    SOCKET cs = ConnectClipboardSocket();
+    if (cs == INVALID_SOCKET)
+        return;
+
+    ClipHeader hdr{};
+    hdr.msg_type = CLIP_MSG_REQUEST;
+    hdr.content_type = CLIP_CONTENT_EMPTY;
+    hdr.data_length = 0;
+
+    uint8_t respType = CLIP_CONTENT_EMPTY;
+    std::vector<char> clipData;
+    bool gotClipboard = false;
+
+    if (TcpSendAll(cs, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
+    {
+        ClipHeader resp{};
+        if (TcpRecvAll(cs, reinterpret_cast<char *>(&resp), sizeof(resp)) &&
+            resp.msg_type == CLIP_MSG_DATA &&
+            resp.data_length <= CLIP_MAX_SIZE)
+        {
+            clipData.resize(resp.data_length);
+            if (resp.data_length == 0 ||
+                TcpRecvAll(cs, clipData.data(), static_cast<int>(resp.data_length)))
+            {
+                respType = resp.content_type;
+                gotClipboard = true;
+            }
+        }
+    }
+
+    closesocket(cs);
+
+    if (gotClipboard && !g_shuttingDown.load(std::memory_order_relaxed))
+        WriteClipboard(respType, clipData);
 }
 
 // ------------------------- hotkey parsing -----------------
@@ -316,17 +463,28 @@ static bool IsHotkeyPressed(DWORD vk)
     if (vk != g_hotkey.key)
         return false;
 
+    auto key_down = [](int key) {
+        return (GetAsyncKeyState(key) & 0x8000) != 0;
+    };
+
     // check that required modifiers are pressed (using tracked state)
     if (g_hotkey.modifiers & MOD_CONTROL)
-        if (!is_ctrl_pressed_down.load())
+        if (!is_ctrl_pressed_down.load(std::memory_order_relaxed) &&
+            !key_down(VK_CONTROL) && !key_down(VK_LCONTROL) && !key_down(VK_RCONTROL))
             return false;
 
     if (g_hotkey.modifiers & MOD_SHIFT)
-        if (!is_shift_pressed_down.load())
+        if (!is_shift_pressed_down.load(std::memory_order_relaxed) &&
+            !key_down(VK_SHIFT) && !key_down(VK_LSHIFT) && !key_down(VK_RSHIFT))
             return false;
 
     if (g_hotkey.modifiers & MOD_ALT)
-        if (!is_alt_pressed_down.load())
+        if (!is_alt_pressed_down.load(std::memory_order_relaxed) &&
+            !key_down(VK_MENU) && !key_down(VK_LMENU) && !key_down(VK_RMENU))
+            return false;
+
+    if (g_hotkey.modifiers & MOD_WIN)
+        if (!key_down(VK_LWIN) && !key_down(VK_RWIN))
             return false;
 
     return true;
@@ -378,81 +536,8 @@ static LRESULT CALLBACK LLMouHook(int nCode, WPARAM wParam, LPARAM lParam)
     if (!g_capturing.load(std::memory_order_relaxed))
         return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
-    const MSLLHOOKSTRUCT *ms = reinterpret_cast<const MSLLHOOKSTRUCT *>(lParam);
-
-    // --- movement: delta = intended position - pinned clip point ---
-    // pt is where the cursor *would* go (post-acceleration). Since we
-    // return 1 (block) the cursor stays at g_clipPoint, so each event's
-    // pt gives us the individual delta from the unmoved cursor.
-    {
-        int dx = ms->pt.x - g_clipPoint.x;
-        int dy = ms->pt.y - g_clipPoint.y;
-        if ((dx | dy) != 0)
-        {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_MOVE;
-            p.data.mouse_move.x = dx;
-            p.data.mouse_move.y = dy;
-            SendPacket(p);
-        }
-    }
-
-    // --- buttons ---
-    switch (wParam)
-    {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    {
-        InputPacket p{};
-        p.type = InputPacket::MOUSE_BUTTON;
-        p.data.mouse_button.button = 0;
-        p.data.mouse_button.down = (wParam == WM_LBUTTONDOWN);
-        SendPacket(p);
-        break;
-    }
-    case WM_RBUTTONDOWN:
-    case WM_RBUTTONUP:
-    {
-        InputPacket p{};
-        p.type = InputPacket::MOUSE_BUTTON;
-        p.data.mouse_button.button = 1;
-        p.data.mouse_button.down = (wParam == WM_RBUTTONDOWN);
-        SendPacket(p);
-        break;
-    }
-    case WM_MBUTTONDOWN:
-    case WM_MBUTTONUP:
-    {
-        InputPacket p{};
-        p.type = InputPacket::MOUSE_BUTTON;
-        p.data.mouse_button.button = 2;
-        p.data.mouse_button.down = (wParam == WM_MBUTTONDOWN);
-        SendPacket(p);
-        break;
-    }
-    case WM_XBUTTONDOWN:
-    case WM_XBUTTONUP:
-    {
-        WORD xbutton = HIWORD(ms->mouseData);
-        InputPacket p{};
-        p.type = InputPacket::MOUSE_BUTTON;
-        p.data.mouse_button.button = (xbutton == XBUTTON1) ? 3 : 4;
-        p.data.mouse_button.down = (wParam == WM_XBUTTONDOWN);
-        SendPacket(p);
-        break;
-    }
-    case WM_MOUSEWHEEL:
-    {
-        SHORT delta = (SHORT)HIWORD(ms->mouseData);
-        InputPacket p{};
-        p.type = InputPacket::MOUSE_WHEEL;
-        p.data.mouse_wheel.delta = (int)delta;
-        SendPacket(p);
-        break;
-    }
-    }
-
-    // block locally
+    // swallow all local mouse events during capture (cursor won't move / no clicks locally).
+    // mouse data capture happens via Raw Input (WM_INPUT), not here.
     return 1;
 }
 
@@ -461,8 +546,9 @@ static void ClipCursor1x1AtCurrent(bool enable)
 {
     if (enable && !g_cursorClipped)
     {
-        GetCursorPos(&g_clipPoint);
-        RECT r{g_clipPoint.x, g_clipPoint.y, g_clipPoint.x + 1, g_clipPoint.y + 1};
+        POINT c;
+        GetCursorPos(&c);
+        RECT r{c.x, c.y, c.x + 1, c.y + 1};
         ClipCursor(&r);
         g_cursorClipped = true;
     }
@@ -482,60 +568,51 @@ static void StartCapture()
     keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
     keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
     keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    is_ctrl_pressed_down.store(false, std::memory_order_relaxed);
+    is_shift_pressed_down.store(false, std::memory_order_relaxed);
+    is_alt_pressed_down.store(false, std::memory_order_relaxed);
 
-    // install LL hooks (eat local input)
+    // register raw input as our mouse data source. zero overhead when unregistered (StopCapture).
+    RAWINPUTDEVICE rid[1]{};
+    rid[0].usUsagePage = 0x01;
+    rid[0].usUsage = 0x02; // mouse
+    rid[0].dwFlags = RIDEV_INPUTSINK;
+    rid[0].hwndTarget = g_msgWnd;
+    if (!RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE)))
+    {
+        std::wcerr << L"RegisterRawInputDevices failed: " << GetLastError() << L"\n";
+        g_capturing = false;
+        return;
+    }
+
+    // install LL hooks (eat local input — mouse hook blocks, kbd hook blocks + relays keys)
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouHook, GetModuleHandleW(nullptr), 0);
     g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LLKbdHook, GetModuleHandleW(nullptr), 0);
+    if (!g_mouseHook || !g_keyHook)
+    {
+        std::wcerr << L"SetWindowsHookEx failed: " << GetLastError() << L"\n";
+        if (g_mouseHook)
+        {
+            UnhookWindowsHookEx(g_mouseHook);
+            g_mouseHook = nullptr;
+        }
+        if (g_keyHook)
+        {
+            UnhookWindowsHookEx(g_keyHook);
+            g_keyHook = nullptr;
+        }
+        rid[0].dwFlags = RIDEV_REMOVE;
+        rid[0].hwndTarget = nullptr;
+        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
+        g_capturing = false;
+        return;
+    }
 
     // optional: pin the cursor so there's no flicker
     ClipCursor1x1AtCurrent(true);
 
-    // clipboard sync: read clipboard now (on main thread), then TCP in background
-    uint8_t clipCt;
-    std::vector<char> clipPayload;
-    ReadClipboard(clipCt, clipPayload);
-
-    std::thread([clipCt, clipPayload = std::move(clipPayload)]() {
-        SOCKET cs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (cs == INVALID_SOCKET) return;
-
-        u_long nb = 1;
-        ioctlsocket(cs, FIONBIO, &nb);
-
-        sockaddr_in clipAddr{};
-        clipAddr.sin_family = AF_INET;
-        clipAddr.sin_port = htons(CLIP_PORT);
-        clipAddr.sin_addr = g_recvAddr.sin_addr;
-
-        connect(cs, reinterpret_cast<sockaddr *>(&clipAddr), sizeof(clipAddr));
-
-        fd_set wset;
-        FD_ZERO(&wset);
-        FD_SET(cs, &wset);
-        timeval tv{2, 0};
-
-        if (select(0, nullptr, &wset, nullptr, &tv) <= 0)
-        {
-            closesocket(cs);
-            return;
-        }
-
-        nb = 0;
-        ioctlsocket(cs, FIONBIO, &nb);
-
-        ClipHeader hdr{};
-        hdr.msg_type = CLIP_MSG_DATA;
-        hdr.content_type = clipCt;
-        hdr.data_length = (uint32_t)clipPayload.size();
-
-        if (TcpSendAll(cs, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
-        {
-            if (!clipPayload.empty())
-                TcpSendAll(cs, clipPayload.data(), (int)clipPayload.size());
-        }
-
-        g_clipSock = cs;
-    }).detach();
+    if (!g_shuttingDown.load(std::memory_order_relaxed))
+        std::thread(PushClipboardToReceiver).detach();
 
     std::wcout << L"capture: ON (local input is blocked)\n";
 }
@@ -545,71 +622,32 @@ static void StopCapture()
     if (!g_capturing.exchange(false))
         return;
 
-    // Send key-up events for Ctrl, Shift, and Alt to the receiver before disconnecting
-    // This ensures they don't get stuck down on the remote machine
-    if (is_ctrl_pressed_down.load())
+    // Key-up spam is harmless and prevents stuck remote modifiers after lag spikes.
     {
         InputPacket p{};
         p.type = InputPacket::KEYBOARD;
+        p.data.keyboard.down = false;
+
         p.data.keyboard.vkCode = VK_CONTROL;
-        p.data.keyboard.down = false;
         SendPacket(p);
-        is_ctrl_pressed_down = false;
-    }
-    if (is_shift_pressed_down.load())
-    {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
         p.data.keyboard.vkCode = VK_SHIFT;
-        p.data.keyboard.down = false;
         SendPacket(p);
-        is_shift_pressed_down = false;
-    }
-    if (is_alt_pressed_down.load())
-    {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
         p.data.keyboard.vkCode = VK_MENU;
-        p.data.keyboard.down = false;
         SendPacket(p);
-        is_alt_pressed_down = false;
+
+        is_ctrl_pressed_down.store(false, std::memory_order_relaxed);
+        is_shift_pressed_down.store(false, std::memory_order_relaxed);
+        is_alt_pressed_down.store(false, std::memory_order_relaxed);
     }
 
-    // clipboard sync: request receiver's clipboard (synchronous — socket is
-    // already connected so this is just a send+recv, ~100ms on LAN even for
-    // large screenshots).  Must complete before we return so the clipboard is
-    // ready when the user pastes.
-    SOCKET clipSnap = g_clipSock;
-    g_clipSock = INVALID_SOCKET;
-
-    if (clipSnap != INVALID_SOCKET)
+    // unregister raw input: no WM_INPUT traffic until next StartCapture.
     {
-        DWORD timeout_ms = 3000;
-        setsockopt(clipSnap, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<char *>(&timeout_ms), sizeof(timeout_ms));
-
-        ClipHeader hdr{};
-        hdr.msg_type = CLIP_MSG_REQUEST;
-        hdr.content_type = CLIP_CONTENT_EMPTY;
-        hdr.data_length = 0;
-
-        if (TcpSendAll(clipSnap, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
-        {
-            ClipHeader resp{};
-            if (TcpRecvAll(clipSnap, reinterpret_cast<char *>(&resp), sizeof(resp)))
-            {
-                if (resp.msg_type == CLIP_MSG_DATA && resp.data_length <= CLIP_MAX_SIZE)
-                {
-                    std::vector<char> clipData(resp.data_length);
-                    if (resp.data_length == 0 || TcpRecvAll(clipSnap, clipData.data(), (int)resp.data_length))
-                    {
-                        WriteClipboard(resp.content_type, clipData);
-                    }
-                }
-            }
-        }
-
-        closesocket(clipSnap);
+        RAWINPUTDEVICE rid[1]{};
+        rid[0].usUsagePage = 0x01;
+        rid[0].usUsage = 0x02; // mouse
+        rid[0].dwFlags = RIDEV_REMOVE;
+        rid[0].hwndTarget = nullptr;
+        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
     }
 
     // remove LL hooks
@@ -625,6 +663,9 @@ static void StopCapture()
     }
 
     ClipCursor1x1AtCurrent(false);
+
+    if (!g_shuttingDown.load(std::memory_order_relaxed))
+        std::thread(PullClipboardFromReceiver).detach();
 
     std::wcout << L"capture: OFF (local input restored)\n";
 }
@@ -649,6 +690,100 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 StartCapture();
         }
         break;
+
+    case WM_INPUT:
+    {
+        if (!g_capturing.load(std::memory_order_relaxed))
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        UINT size = 0;
+        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        BYTE buf[1024];
+        if (size > sizeof(buf))
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) != size)
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+        RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(buf);
+
+        if (ri->header.dwType == RIM_TYPEMOUSE)
+        {
+            const RAWMOUSE &m = ri->data.mouse;
+
+            // relative motion only
+            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE))
+            {
+                int dx = (int)m.lLastX;
+                int dy = (int)m.lLastY;
+                if ((dx | dy) != 0)
+                {
+                    InputPacket p{};
+                    p.type = InputPacket::MOUSE_MOVE;
+                    p.data.mouse_move.x = dx;
+                    p.data.mouse_move.y = dy;
+                    SendPacket(p);
+                }
+            }
+
+            // buttons
+            const USHORT f = m.usButtonFlags;
+            if (f & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP))
+            {
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_BUTTON;
+                p.data.mouse_button.button = 0;
+                p.data.mouse_button.down = (f & RI_MOUSE_LEFT_BUTTON_DOWN) != 0;
+                SendPacket(p);
+            }
+            if (f & (RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP))
+            {
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_BUTTON;
+                p.data.mouse_button.button = 1;
+                p.data.mouse_button.down = (f & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0;
+                SendPacket(p);
+            }
+            if (f & (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_UP))
+            {
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_BUTTON;
+                p.data.mouse_button.button = 2;
+                p.data.mouse_button.down = (f & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0;
+                SendPacket(p);
+            }
+            if (f & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP))
+            {
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_BUTTON;
+                p.data.mouse_button.button = 3;
+                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_4_DOWN) != 0;
+                SendPacket(p);
+            }
+            if (f & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP))
+            {
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_BUTTON;
+                p.data.mouse_button.button = 4;
+                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_5_DOWN) != 0;
+                SendPacket(p);
+            }
+
+            // wheel
+            if (f & RI_MOUSE_WHEEL)
+            {
+                SHORT delta = (SHORT)m.usButtonData;
+                InputPacket p{};
+                p.type = InputPacket::MOUSE_WHEEL;
+                p.data.mouse_wheel.delta = (int)delta;
+                SendPacket(p);
+            }
+        }
+
+        // DefWindowProc frees the RAWINPUT buffer — required to avoid a leak per event
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
 
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -713,17 +848,21 @@ int wmain(int argc, wchar_t *argv[])
     g_recvAddr.sin_family = AF_INET;
     g_recvAddr.sin_port = htons(PORT);
     {
-        char ipA[64];
-        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, ipA, 64, nullptr, nullptr);
-        if (inet_pton(AF_INET, ipA, &g_recvAddr.sin_addr) <= 0)
+        char hostA[256];
+        WideCharToMultiByte(CP_UTF8, 0, argv[1], -1, hostA, sizeof(hostA), nullptr, nullptr);
+        g_targetHost = hostA;
+        if (inet_pton(AF_INET, hostA, &g_recvAddr.sin_addr) == 1)
         {
-            std::cerr << "invalid ip\n";
+            g_targetIsLiteralIp = true;
+        }
+        else if (!ResolveTarget())
+        {
+            std::cerr << "could not resolve target '" << hostA << "'\n";
             closesocket(g_sock);
             WSACleanup();
             return 1;
         }
     }
-
     // window class + hidden message-only window
     WNDCLASSEXW wc{sizeof(WNDCLASSEXW)};
     wc.lpfnWndProc = HiddenWndProc;
@@ -768,12 +907,11 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     // cleanup
+    g_shuttingDown.store(true);
     UnregisterHotKey(g_msgWnd, HOTKEY_ID);
     StopCapture(); // ensures hooks uninstalled, raw input unregistered, cursor unclipped
     if (g_msgWnd)
         DestroyWindow(g_msgWnd);
-    if (g_clipSock != INVALID_SOCKET)
-        closesocket(g_clipSock);
     if (g_sock != INVALID_SOCKET)
         closesocket(g_sock);
     WSACleanup();

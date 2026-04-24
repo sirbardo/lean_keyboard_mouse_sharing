@@ -145,6 +145,8 @@ static DWORD WINAPI CursorThreadProc(LPVOID)
 // ------------------------- clipboard protocol -------------
 static constexpr int CLIP_PORT = 7778;
 static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
+static constexpr DWORD CLIP_IO_TIMEOUT_MS = 3000;
+static constexpr long CLIP_IDLE_TIMEOUT_SEC = 5;
 
 #pragma pack(push, 1)
 struct ClipHeader
@@ -294,7 +296,7 @@ static void ClipboardThread()
         return;
     }
 
-    if (listen(listenSock, 1) == SOCKET_ERROR)
+    if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR)
     {
         closesocket(listenSock);
         return;
@@ -318,6 +320,11 @@ static void ClipboardThread()
         if (client == INVALID_SOCKET)
             continue;
 
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char *>(&CLIP_IO_TIMEOUT_MS), sizeof(CLIP_IO_TIMEOUT_MS));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char *>(&CLIP_IO_TIMEOUT_MS), sizeof(CLIP_IO_TIMEOUT_MS));
+
         // serve this connection until it closes (use select to avoid
         // blocking forever so we can check g_running periodically)
         while (g_running)
@@ -325,11 +332,11 @@ static void ClipboardThread()
             fd_set cset;
             FD_ZERO(&cset);
             FD_SET(client, &cset);
-            timeval ctv{2, 0};
+            timeval ctv{CLIP_IDLE_TIMEOUT_SEC, 0};
 
             int csel = select(0, &cset, nullptr, nullptr, &ctv);
             if (csel < 0) break;   // error
-            if (csel == 0) continue; // timeout — check g_running and wait again
+            if (csel == 0) break;   // idle/stale client: accept a fresh one
 
             ClipHeader hdr{};
             if (!TcpRecvAll(client, reinterpret_cast<char *>(&hdr), sizeof(hdr)))
@@ -346,6 +353,7 @@ static void ClipboardThread()
                     break;
 
                 WriteClipboard(hdr.content_type, clipData);
+                break;
             }
             else if (hdr.msg_type == CLIP_MSG_REQUEST)
             {
@@ -363,6 +371,7 @@ static void ClipboardThread()
                     break;
                 if (!clipData.empty() && !TcpSendAll(client, clipData.data(), (int)clipData.size()))
                     break;
+                break;
             }
             else
             {

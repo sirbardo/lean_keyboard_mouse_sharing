@@ -16,15 +16,19 @@ Zero-overhead keyboard/mouse sharing between two Windows PCs.
 
 When inactive (99% of the time):
 - NO hooks installed (apart from the hotkey's)
+- NO Raw Input registration
+- NO capture/clipboard worker threads
 - NO network activity
 - NO polling loops
 - Essentially zero CPU/memory usage
 
 When active (after pressing hotkey):
-- Low-level hooks capture keyboard and mouse input at full polling rate
+- Low-level hook captures keyboard input
+- Raw Input API captures mouse movement/buttons/wheel
+- Low-level mouse hook only blocks local mouse input
 - Direct UDP transmission to target PC
 - Input is blocked on source PC
-- Clipboard is synced via TCP (sender's clipboard pushed on capture start, receiver's clipboard pulled on capture stop)
+- Clipboard is synced via short-lived TCP only at toggle boundaries
 
 ## Building
 
@@ -54,6 +58,8 @@ sender.exe 192.168.1.100 --hotkey=CTRL+SHIFT+K
 ```
 (Replace with actual IP of streaming PC)
 
+Clipboard sync runs only at toggle boundaries: sender clipboard is pushed when capture turns on, and receiver clipboard is pulled back when capture turns off. There is no clipboard monitor, persistent TCP socket, or clipboard/network activity while idle.
+
 You can also set the hotkey in a `sender.cfg` file next to the exe:
 ```
 HOTKEY=ALT+1
@@ -62,11 +68,12 @@ HOTKEY=ALT+1
 ## Controls
 
 - **ALT+1** (default) - Toggle control between PCs
+- `--hotkey=ALT+C` - Example custom toggle hotkey
 
 ## Network
 
 - Port 7777 (UDP) - keyboard/mouse input
-- Port 7778 (TCP) - clipboard sync
+- Port 7778 (TCP) - boundary clipboard sync
 - Ensure Windows Firewall allows both ports
 - Both PCs must be on same network
 
